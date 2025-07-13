@@ -89,6 +89,37 @@ const Sudoku = struct {
 
         return true;
     }
+
+    pub fn format(
+        self: *const Sudoku,
+        comptime fmt: []const u8,
+        options: std.fmt.FormatOptions,
+        writer: anytype,
+    ) !void {
+        _ = fmt; // ignore format string for now
+        _ = options; // ignore formatting options for now
+        try writer.print("main.Sudoku{{\n\t.puzzle = {{\n", .{});
+        try printSudoku(writer, self.puzzle);
+        try writer.print("\t}},\n\t.solution = {{\n", .{});
+        try printSudoku(writer, self.solution);
+        try writer.print("\t}},\n}}", .{});
+    }
+
+    fn printSudoku(writer: anytype, sudoku: [81]u8) !void {
+        for (0..9) |row| {
+            if (row % 3 == 0 and row != 0) {
+                try writer.print("\t\t---------------------\n", .{});
+            }
+            try writer.print("\t\t", .{});
+            for (0..9) |col| {
+                if (col % 3 == 0 and col != 0) {
+                    try writer.print("| ", .{});
+                }
+                try writer.print("{} ", .{sudoku[row * 9 + col]});
+            }
+            try writer.print("\n", .{});
+        }
+    }
 };
 
 test "Sudoku.isValid" {
@@ -186,32 +217,49 @@ pub fn main() !void {
         try convertToNumber(sudoku);
     }
 
-    var solveTimes = std.ArrayList(i128).init(allocator);
+    std.debug.print("Loaded all sudokus, starting to solve...\n", .{});
+
+    const Timing = struct {
+        bruteForce: i128,
+        smart: i128,
+    };
+
+    var solveTimes = std.ArrayList(Timing).init(allocator);
     defer solveTimes.deinit();
 
     for (sudokus.items) |*value| {
-        const start = std.time.nanoTimestamp();
+        const timing = try solveTimes.addOne();
 
-        const isSolved = try solve(allocator, value);
-        if (isSolved) {
-            std.debug.print("Found solution!\n", .{});
-        } else {
-            std.debug.print("Failed to find solution!\n", .{});
+        {
+            const start = std.time.nanoTimestamp();
+            const isSolved = try solveBruteForce(allocator, value);
+            if (!isSolved) {
+                std.debug.print("Failed to find brute force solution!\n", .{});
+            }
+            const end = std.time.nanoTimestamp();
+            timing.bruteForce = end - start;
         }
 
-        const end = std.time.nanoTimestamp();
-        const elapsedNs = try solveTimes.addOne();
-        elapsedNs.* = end - start;
-
-        std.debug.print("Elapsed: {}ms\n", .{@divTrunc(elapsedNs.*, 1000000)});
+        {
+            const start = std.time.nanoTimestamp();
+            const isSolved = try solveSmart(allocator, value);
+            if (!isSolved) {
+                std.debug.print("Failed to find smart solution!\n", .{});
+            }
+            const end = std.time.nanoTimestamp();
+            timing.smart = end - start;
+        }
     }
 
-    var averageSolveTime: i128 = 0;
+    var averageSolveTime = Timing{ .bruteForce = 0, .smart = 0 };
     for (solveTimes.items) |time| {
-        averageSolveTime += time;
+        averageSolveTime.bruteForce += time.bruteForce;
+        averageSolveTime.smart += time.smart;
     }
-    averageSolveTime = @divTrunc(averageSolveTime, solveTimes.items.len);
-    std.debug.print("Average time: {}ms\n", .{@divTrunc(averageSolveTime, 1000000)});
+    averageSolveTime.bruteForce = @divTrunc(averageSolveTime.bruteForce, solveTimes.items.len);
+    averageSolveTime.smart = @divTrunc(averageSolveTime.smart, solveTimes.items.len);
+    std.debug.print("Average time brute force: {:>10}ns\n", .{averageSolveTime.bruteForce});
+    std.debug.print("Average time smart:       {:>10}ns\n", .{averageSolveTime.smart});
 }
 
 fn hasBytesLeft(file: std.fs.File) bool {
@@ -239,7 +287,7 @@ fn convertToNumber(sudoku: *Sudoku) SudokuError!void {
     }
 }
 
-fn solve(allocator: std.mem.Allocator, sudoku_: *Sudoku) !bool {
+fn solveBruteForce(allocator: std.mem.Allocator, sudoku_: *Sudoku) !bool {
     var queue = Queue(Sudoku).init(allocator);
     defer queue.deinit();
     try queue.enqueue(sudoku_.*);
@@ -273,4 +321,144 @@ fn solve(allocator: std.mem.Allocator, sudoku_: *Sudoku) !bool {
     }
 
     return false;
+}
+
+const Notes = struct {
+    data: [81 * 9]u8,
+
+    pub fn saveNote(self: *Notes, row: u8, col: u8, num: u8) void {
+        const idx = index(row, col, num);
+        self.data[idx] = num;
+    }
+
+    pub fn clearNote(self: *Notes, row: u8, col: u8, num: u8) void {
+        const idx = index(row, col, num);
+        self.data[idx] = 0;
+    }
+
+    pub fn getSingleNote(self: *Notes, row: u8, col: u8) ?u8 {
+        var lastNumber: ?u8 = null;
+        for (1..10) |num| {
+            const idx = index(row, col, @intCast(num));
+            if (self.data[idx] == 0) {
+                continue;
+            }
+
+            if (lastNumber != null) {
+                return null;
+            }
+
+            lastNumber = self.data[idx];
+        }
+        return lastNumber;
+    }
+
+    pub fn updateNotesAfterPlacingNumber(self: *Notes, row: u8, col: u8, num: u8) void {
+        // clear notes for num in same row
+        for (0..9) |clearCol| {
+            const idx = index(row, clearCol, num);
+            self.data[idx] = 0;
+        }
+
+        // clear notes for num in same column
+        for (0..9) |clearRow| {
+            const idx = index(clearRow, col, num);
+            self.data[idx] = 0;
+        }
+
+        // clear notes for num in same square
+        const square = (row / 3) * 3 + col / 3;
+        for (0..3) |squareRow| {
+            for (0..3) |squareCol| {
+                const row_ = squareRow + (square / 3) * 3;
+                const col_ = squareCol + (square % 3) * 3;
+                const idx = index(row_, col_, num);
+                self.data[idx] = 0;
+            }
+        }
+    }
+
+    fn index(row: usize, col: usize, num: u8) u64 {
+        return row * 81 + col * 9 + (num - 1);
+    }
+};
+
+fn solveSmart(_: std.mem.Allocator, sudoku_: *Sudoku) !bool {
+    // add all possible numbers to a "notes" data structure
+    var notes = Notes{ .data = [_]u8{0} ** (81 * 9) };
+    for (1..10) |num| {
+        for (0..9) |row| {
+            for (0..9) |col| {
+                if (sudoku_.puzzle[row * 9 + col] != 0) {
+                    continue;
+                }
+
+                // check row
+                var hasNumInRow = false;
+                for (0..9) |checkCol| {
+                    if (sudoku_.puzzle[row * 9 + checkCol] == num) {
+                        hasNumInRow = true;
+                        break;
+                    }
+                }
+                if (hasNumInRow) {
+                    continue;
+                }
+
+                // check col
+                var hasNumInCol = false;
+                for (0..9) |checkRow| {
+                    if (sudoku_.puzzle[checkRow * 9 + col] == num) {
+                        hasNumInCol = true;
+                        break;
+                    }
+                }
+                if (hasNumInCol) {
+                    continue;
+                }
+
+                // check square
+                var hasNumInSquare = false;
+                const square = (row / 3) * 3 + col / 3;
+                for (0..3) |squareRow| {
+                    for (0..3) |squareCol| {
+                        const row_ = squareRow + (square / 3) * 3;
+                        const col_ = squareCol + (square % 3) * 3;
+                        if (sudoku_.puzzle[row_ * 9 + col_] == num) {
+                            hasNumInSquare = true;
+                            break;
+                        }
+                    }
+                    if (hasNumInSquare) {
+                        break;
+                    }
+                }
+
+                if (hasNumInSquare) {
+                    continue;
+                }
+
+                notes.saveNote(@intCast(row), @intCast(col), @intCast(num));
+            }
+        }
+    }
+
+    var counter: usize = 0;
+    while (!sudoku_.isSolved() and counter < 100) {
+        // check whether there is a field with a single number noted
+        for (0..9) |row| {
+            for (0..9) |col| {
+                const number = notes.getSingleNote(@intCast(row), @intCast(col)) orelse continue;
+                sudoku_.puzzle[row * 9 + col] = number;
+                notes.updateNotesAfterPlacingNumber(@intCast(row), @intCast(col), number);
+            }
+        }
+
+        counter += 1;
+    }
+
+    // std.debug.print("{}\n", .{sudoku_});
+    // std.debug.print("{}\n", .{notes});
+
+    return sudoku_.isSolved();
 }
