@@ -7,8 +7,38 @@ const SudokuError = error{
 };
 
 const Sudoku = struct {
-    puzzle: [81]u8,
-    solution: [81]u8,
+    puzzle: [81]u8 = [_]u8{0} ** 81,
+    solution: [81]u8 = [_]u8{0} ** 81,
+
+    pub fn init(file: std.fs.File) !Sudoku {
+        var sudoku = Sudoku{};
+
+        {
+            const read_bytes = try file.read(&sudoku.puzzle);
+            if (read_bytes != 81) {
+                std.debug.print("failed to read puzzle", .{});
+                return error.InvalidPuzzle;
+            }
+        }
+
+        // skip comma
+        try file.seekBy(1);
+
+        {
+            const read_bytes = try file.read(&sudoku.solution);
+            if (read_bytes != 81) {
+                std.debug.print("failed to read solution", .{});
+                return error.InvalidSolution;
+            }
+        }
+
+        // skip newline
+        try file.seekBy(1);
+
+        try convertToNumber(&sudoku);
+
+        return sudoku;
+    }
 
     pub fn copy(self: *const Sudoku) Sudoku {
         var result = Sudoku{
@@ -156,9 +186,9 @@ fn Queue(comptime T: type) type {
     return struct {
         list: std.ArrayList(T),
 
-        pub fn init(allocator: std.mem.Allocator) Queue(T) {
+        pub fn init(gpa: std.mem.Allocator) Queue(T) {
             return Queue(T){
-                .list = std.ArrayList(T).init(allocator),
+                .list = std.ArrayList(T).init(gpa),
             };
         }
 
@@ -182,57 +212,39 @@ fn Queue(comptime T: type) type {
 }
 
 pub fn main() !void {
+    const start_time = std.time.nanoTimestamp();
+
+    const include_brute_force = false;
+
     const file = try std.fs.openFileAbsolute("/home/henne/Downloads/sudoku/sudoku.csv", .{});
     defer file.close();
 
+    try file.seekFromEnd(0);
+    const total_file_size = try file.getPos();
+    const sudoku_count: i64 = @intCast((total_file_size - 16) / 164); // 81 + 1 + 81 + 1 = 164 bytes per sudoku
+    std.debug.print("Found {} sudokus\n", .{sudoku_count});
+
+    try file.seekTo(0);
     try file.seekBy(16);
-
-    const allocator = std.heap.page_allocator;
-
-    var sudokus = std.ArrayList(Sudoku).init(allocator);
-    defer sudokus.deinit();
-
-    while (hasBytesLeft(file) and sudokus.items.len < 100) {
-        var sudoku = try sudokus.addOne();
-        {
-            const read_bytes = try file.read(&sudoku.puzzle);
-            if (read_bytes != 81) {
-                std.debug.print("failed to read puzzle", .{});
-                return;
-            }
-        }
-
-        try file.seekBy(1);
-
-        {
-            const read_bytes = try file.read(&sudoku.solution);
-            if (read_bytes != 81) {
-                std.debug.print("failed to read solution", .{});
-                return;
-            }
-        }
-
-        try file.seekBy(1);
-
-        try convertToNumber(sudoku);
-    }
-
-    std.debug.print("Loaded all sudokus, starting to solve...\n", .{});
+    const gpa = std.heap.page_allocator;
 
     const Timing = struct {
-        bruteForce: i128,
-        smart: i128,
+        bruteForce: i128 = 0,
+        single_number_in_cell_notes: i128 = 0,
+        single_number_in_row_col_or_square: i128 = 0,
     };
 
-    var solveTimes = std.ArrayList(Timing).init(allocator);
-    defer solveTimes.deinit();
+    var solve_times = std.ArrayList(Timing).init(gpa);
+    defer solve_times.deinit();
 
-    for (sudokus.items) |*value| {
-        const timing = try solveTimes.addOne();
+    var processed_sudokus: i64 = 0;
+    while (hasBytesLeft(file) and processed_sudokus < 100) {
+        var sudoku = try Sudoku.init(file);
 
-        {
+        var timing = Timing{};
+        if (include_brute_force) {
             const start = std.time.nanoTimestamp();
-            const isSolved = try solveBruteForce(allocator, value);
+            const isSolved = try solveBruteForce(gpa, &sudoku);
             if (!isSolved) {
                 std.debug.print("Failed to find brute force solution!\n", .{});
             }
@@ -242,24 +254,49 @@ pub fn main() !void {
 
         {
             const start = std.time.nanoTimestamp();
-            const isSolved = try solveSmart(allocator, value);
+            const isSolved = try solveSingleNumberInCellNotes(gpa, &sudoku);
             if (!isSolved) {
-                std.debug.print("Failed to find smart solution!\n", .{});
+                std.debug.print("Failed to find single_number_in_cell_notes solution!\n", .{});
             }
             const end = std.time.nanoTimestamp();
-            timing.smart = end - start;
+            timing.single_number_in_cell_notes = end - start;
         }
+
+        {
+            const start = std.time.nanoTimestamp();
+            const isSolved = try solveSingleNumberInRowColOrSquare(gpa, &sudoku);
+            if (!isSolved) {
+                std.debug.print("Failed to find single_number_in_row_col_or_square solution!\n", .{});
+            }
+            const end = std.time.nanoTimestamp();
+            timing.single_number_in_row_col_or_square = end - start;
+        }
+
+        try solve_times.append(timing);
+        processed_sudokus += 1;
+
+        const processed_sudokus_f: f32 = @floatFromInt(processed_sudokus);
+        const sudoku_count_f: f32 = @floatFromInt(sudoku_count);
+        const percent_processed: f32 = processed_sudokus_f / sudoku_count_f * 100.0;
+        const processed_sudokus_unsigned: u64 = @intCast(processed_sudokus);
+        std.debug.print("Processed {d:>7}/{} ({d:.4}%) sudokus\n", .{ processed_sudokus_unsigned, sudoku_count, percent_processed });
     }
 
-    var averageSolveTime = Timing{ .bruteForce = 0, .smart = 0 };
-    for (solveTimes.items) |time| {
-        averageSolveTime.bruteForce += time.bruteForce;
-        averageSolveTime.smart += time.smart;
+    var average_solve_time = Timing{};
+    for (solve_times.items) |time| {
+        average_solve_time.bruteForce += time.bruteForce;
+        average_solve_time.single_number_in_cell_notes += time.single_number_in_cell_notes;
     }
-    averageSolveTime.bruteForce = @divTrunc(averageSolveTime.bruteForce, solveTimes.items.len);
-    averageSolveTime.smart = @divTrunc(averageSolveTime.smart, solveTimes.items.len);
-    std.debug.print("Average time brute force: {:>10}ns\n", .{averageSolveTime.bruteForce});
-    std.debug.print("Average time smart:       {:>10}ns\n", .{averageSolveTime.smart});
+    average_solve_time.bruteForce = @divTrunc(average_solve_time.bruteForce, solve_times.items.len);
+    average_solve_time.single_number_in_cell_notes = @divTrunc(average_solve_time.single_number_in_cell_notes, solve_times.items.len);
+    const avg_brute_force_ns: u128 = @intCast(average_solve_time.bruteForce);
+    const avg_brute_obvious_ns: u128 = @intCast(average_solve_time.single_number_in_cell_notes);
+    std.debug.print("Average time brute_force:                       {:>10}ns\n", .{avg_brute_force_ns});
+    std.debug.print("Average time single_number_in_cell_notes:       {:>10}ns\n", .{avg_brute_obvious_ns});
+
+    const total_time_ns: f64 = @floatFromInt(std.time.nanoTimestamp() - start_time);
+    const total_time_s = total_time_ns / 1000000000.0;
+    std.debug.print("Total time:                                     {:>10.3}s\n", .{total_time_s});
 }
 
 fn hasBytesLeft(file: std.fs.File) bool {
@@ -287,8 +324,8 @@ fn convertToNumber(sudoku: *Sudoku) SudokuError!void {
     }
 }
 
-fn solveBruteForce(allocator: std.mem.Allocator, sudoku_: *Sudoku) !bool {
-    var queue = Queue(Sudoku).init(allocator);
+fn solveBruteForce(gpa: std.mem.Allocator, sudoku_: *Sudoku) !bool {
+    var queue = Queue(Sudoku).init(gpa);
     defer queue.deinit();
     try queue.enqueue(sudoku_.*);
 
@@ -325,6 +362,68 @@ fn solveBruteForce(allocator: std.mem.Allocator, sudoku_: *Sudoku) !bool {
 
 const Notes = struct {
     data: [81 * 9]u8,
+
+    pub fn init(sudoku: *const Sudoku) Notes {
+        var notes = Notes{ .data = [_]u8{0} ** (81 * 9) };
+        for (1..10) |num| {
+            for (0..9) |row| {
+                for (0..9) |col| {
+                    if (sudoku.puzzle[row * 9 + col] != 0) {
+                        continue;
+                    }
+
+                    // check row
+                    var hasNumInRow = false;
+                    for (0..9) |checkCol| {
+                        if (sudoku.puzzle[row * 9 + checkCol] == num) {
+                            hasNumInRow = true;
+                            break;
+                        }
+                    }
+                    if (hasNumInRow) {
+                        continue;
+                    }
+
+                    // check col
+                    var hasNumInCol = false;
+                    for (0..9) |checkRow| {
+                        if (sudoku.puzzle[checkRow * 9 + col] == num) {
+                            hasNumInCol = true;
+                            break;
+                        }
+                    }
+                    if (hasNumInCol) {
+                        continue;
+                    }
+
+                    // check square
+                    var hasNumInSquare = false;
+                    const square = (row / 3) * 3 + col / 3;
+                    for (0..3) |squareRow| {
+                        for (0..3) |squareCol| {
+                            const row_ = squareRow + (square / 3) * 3;
+                            const col_ = squareCol + (square % 3) * 3;
+                            if (sudoku.puzzle[row_ * 9 + col_] == num) {
+                                hasNumInSquare = true;
+                                break;
+                            }
+                        }
+                        if (hasNumInSquare) {
+                            break;
+                        }
+                    }
+
+                    if (hasNumInSquare) {
+                        continue;
+                    }
+
+                    notes.saveNote(@intCast(row), @intCast(col), @intCast(num));
+                }
+            }
+        }
+
+        return notes;
+    }
 
     pub fn saveNote(self: *Notes, row: u8, col: u8, num: u8) void {
         const idx = index(row, col, num);
@@ -383,65 +482,8 @@ const Notes = struct {
     }
 };
 
-fn solveSmart(_: std.mem.Allocator, sudoku_: *Sudoku) !bool {
-    // add all possible numbers to a "notes" data structure
-    var notes = Notes{ .data = [_]u8{0} ** (81 * 9) };
-    for (1..10) |num| {
-        for (0..9) |row| {
-            for (0..9) |col| {
-                if (sudoku_.puzzle[row * 9 + col] != 0) {
-                    continue;
-                }
-
-                // check row
-                var hasNumInRow = false;
-                for (0..9) |checkCol| {
-                    if (sudoku_.puzzle[row * 9 + checkCol] == num) {
-                        hasNumInRow = true;
-                        break;
-                    }
-                }
-                if (hasNumInRow) {
-                    continue;
-                }
-
-                // check col
-                var hasNumInCol = false;
-                for (0..9) |checkRow| {
-                    if (sudoku_.puzzle[checkRow * 9 + col] == num) {
-                        hasNumInCol = true;
-                        break;
-                    }
-                }
-                if (hasNumInCol) {
-                    continue;
-                }
-
-                // check square
-                var hasNumInSquare = false;
-                const square = (row / 3) * 3 + col / 3;
-                for (0..3) |squareRow| {
-                    for (0..3) |squareCol| {
-                        const row_ = squareRow + (square / 3) * 3;
-                        const col_ = squareCol + (square % 3) * 3;
-                        if (sudoku_.puzzle[row_ * 9 + col_] == num) {
-                            hasNumInSquare = true;
-                            break;
-                        }
-                    }
-                    if (hasNumInSquare) {
-                        break;
-                    }
-                }
-
-                if (hasNumInSquare) {
-                    continue;
-                }
-
-                notes.saveNote(@intCast(row), @intCast(col), @intCast(num));
-            }
-        }
-    }
+fn solveSingleNumberInCellNotes(gpa: std.mem.Allocator, sudoku_: *Sudoku) !bool {
+    var notes = Notes.init(sudoku_);
 
     var counter: usize = 0;
     while (!sudoku_.isSolved() and counter < 100) {
@@ -457,8 +499,5 @@ fn solveSmart(_: std.mem.Allocator, sudoku_: *Sudoku) !bool {
         counter += 1;
     }
 
-    // std.debug.print("{}\n", .{sudoku_});
-    // std.debug.print("{}\n", .{notes});
-
-    return sudoku_.isSolved();
+    return solveBruteForce(gpa, sudoku_);
 }
