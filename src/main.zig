@@ -211,69 +211,61 @@ fn Queue(comptime T: type) type {
     };
 }
 
+pub const SolverError = error{
+    OutOfMemory,
+};
+
+const Solver = struct {
+    name: []const u8,
+    solve_func: *const fn (std.mem.Allocator, *Sudoku) SolverError!bool,
+    enabled: bool = true,
+    average_time_ns: i128 = 0,
+};
+
 pub fn main() !void {
     const start_time = std.time.nanoTimestamp();
-
-    const include_brute_force = false;
-    const include_single_number_in_cell_notes = false;
 
     const file = try std.fs.openFileAbsolute("/home/henne/Downloads/sudoku/sudoku.csv", .{});
     defer file.close();
 
     try file.seekFromEnd(0);
     const total_file_size = try file.getPos();
-    const sudoku_count: i64 = @intCast((total_file_size - 16) / 164); // 81 + 1 + 81 + 1 = 164 bytes per sudoku
+    const header_bytes = 16;
+    const bytes_per_sudoku = 81 + 1 + 81 + 1;
+    const sudoku_count: i64 = @intCast((total_file_size - header_bytes) / bytes_per_sudoku);
     std.debug.print("Found {} sudokus\n", .{sudoku_count});
 
     try file.seekTo(0);
     try file.seekBy(16);
     const gpa = std.heap.page_allocator;
 
-    const Timing = struct {
-        bruteForce: i128 = 0,
-        single_number_in_cell_notes: i128 = 0,
-        single_number_in_row_col_or_square: i128 = 0,
+    var solvers = [_]Solver{
+        .{ .name = "brute_force", .solve_func = solveBruteForce, .enabled = false },
+        .{ .name = "single_number_in_cell_notes", .solve_func = solveSingleNumberInCellNotes },
+        .{ .name = "single_number_in_row_col_or_square", .solve_func = solveSingleNumberInRowColOrSquare },
     };
-
-    var solve_times = std.ArrayList(Timing).init(gpa);
-    defer solve_times.deinit();
 
     var processed_sudokus: i64 = 0;
     while (hasBytesLeft(file) and processed_sudokus < 1000) {
-        var sudoku = try Sudoku.init(file);
+        const sudoku = try Sudoku.init(file);
 
-        var timing = Timing{};
-        if (include_brute_force) {
-            const start = std.time.nanoTimestamp();
-            const isSolved = try solveBruteForce(gpa, &sudoku);
-            if (!isSolved) {
-                std.debug.print("Failed to find brute force solution!\n", .{});
+        for (&solvers) |*solver| {
+            if (!solver.enabled) {
+                continue;
             }
+
+            var sudoku_copy = sudoku.copy();
+            const start = std.time.nanoTimestamp();
+            const isSolved = try solver.solve_func(gpa, &sudoku_copy);
+            if (!isSolved) {
+                std.debug.print("Failed to find solution for {s}!\n", .{solver.name});
+            }
+
             const end = std.time.nanoTimestamp();
-            timing.bruteForce = end - start;
+            const time_ns = end - start;
+            solver.average_time_ns += @divTrunc(time_ns - solver.average_time_ns, processed_sudokus + 1);
         }
 
-        if (include_single_number_in_cell_notes) {
-            const start = std.time.nanoTimestamp();
-            const isSolved = try solveSingleNumberInCellNotes(gpa, &sudoku);
-            if (!isSolved) {
-                std.debug.print("Failed to find single_number_in_cell_notes solution!\n", .{});
-            }
-            const end = std.time.nanoTimestamp();
-            timing.single_number_in_cell_notes = end - start;
-        }
-
-        {
-            const start = std.time.nanoTimestamp();
-            const isSolved = try solveSingleNumberInRowColOrSquare(gpa, &sudoku);
-            if (!isSolved) {
-                std.debug.print("Failed to find single_number_in_row_col_or_square solution!\n", .{});
-            }
-            const end = std.time.nanoTimestamp();
-            timing.single_number_in_row_col_or_square = end - start;
-        }
-
-        try solve_times.append(timing);
         processed_sudokus += 1;
 
         const processed_sudokus_f: f32 = @floatFromInt(processed_sudokus);
@@ -283,21 +275,9 @@ pub fn main() !void {
         std.debug.print("Processed {d:>7}/{} ({d:.4}%) sudokus\n", .{ processed_sudokus_unsigned, sudoku_count, percent_processed });
     }
 
-    var average_solve_time = Timing{};
-    for (solve_times.items) |time| {
-        average_solve_time.bruteForce += time.bruteForce;
-        average_solve_time.single_number_in_cell_notes += time.single_number_in_cell_notes;
-        average_solve_time.single_number_in_row_col_or_square += time.single_number_in_row_col_or_square;
+    for (&solvers) |*solver| {
+        std.debug.print("Average time {s:>34}: {:>10}ns\n", .{ solver.name, solver.average_time_ns });
     }
-    average_solve_time.bruteForce = @divTrunc(average_solve_time.bruteForce, solve_times.items.len);
-    average_solve_time.single_number_in_cell_notes = @divTrunc(average_solve_time.single_number_in_cell_notes, solve_times.items.len);
-    average_solve_time.single_number_in_row_col_or_square = @divTrunc(average_solve_time.single_number_in_row_col_or_square, solve_times.items.len);
-    const avg_brute_force_ns: u128 = @intCast(average_solve_time.bruteForce);
-    const avg_single_number_in_cell_notes_ns: u128 = @intCast(average_solve_time.single_number_in_cell_notes);
-    const avg_single_number_in_row_col_or_square_ns: u128 = @intCast(average_solve_time.single_number_in_row_col_or_square);
-    std.debug.print("Average time brute_force:                        {:>10}ns\n", .{avg_brute_force_ns});
-    std.debug.print("Average time single_number_in_cell_notes:        {:>10}ns\n", .{avg_single_number_in_cell_notes_ns});
-    std.debug.print("Average time single_number_in_row_col_or_square: {:>10}ns\n", .{avg_single_number_in_row_col_or_square_ns});
 
     const total_time_ns: f64 = @floatFromInt(std.time.nanoTimestamp() - start_time);
     const total_time_s = total_time_ns / 1000000000.0;
@@ -422,7 +402,7 @@ const Notes = struct {
                         continue;
                     }
 
-                    notes.saveNote(@intCast(row), @intCast(col), @intCast(num));
+                    notes.saveNote(row, col, num);
                 }
             }
         }
@@ -430,20 +410,20 @@ const Notes = struct {
         return notes;
     }
 
-    pub fn saveNote(self: *Notes, row: u8, col: u8, num: u8) void {
+    pub fn saveNote(self: *Notes, row: usize, col: usize, num: usize) void {
         const idx = index(row, col, num);
-        self.data[idx] = num;
+        self.data[idx] = @intCast(num);
     }
 
-    pub fn clearNote(self: *Notes, row: u8, col: u8, num: u8) void {
+    pub fn clearNote(self: *Notes, row: usize, col: usize, num: usize) void {
         const idx = index(row, col, num);
         self.data[idx] = 0;
     }
 
-    pub fn getSingleNote(self: *Notes, row: u8, col: u8) ?u8 {
+    pub fn getSingleNote(self: *Notes, row: usize, col: usize) ?u8 {
         var lastNumber: ?u8 = null;
         for (1..10) |num| {
-            const idx = index(row, col, @intCast(num));
+            const idx = index(row, col, num);
             if (self.data[idx] == 0) {
                 continue;
             }
@@ -457,10 +437,10 @@ const Notes = struct {
         return lastNumber;
     }
 
-    pub fn updateNotesAfterPlacingNumber(self: *Notes, row: u8, col: u8, num: u8) void {
+    pub fn updateNotesAfterPlacingNumber(self: *Notes, row: usize, col: usize, num: usize) void {
         // clear notes for this cell
         for (1..10) |n| {
-            const idx = index(row, col, @intCast(n));
+            const idx = index(row, col, n);
             self.data[idx] = 0;
         }
 
@@ -488,12 +468,12 @@ const Notes = struct {
         }
     }
 
-    pub fn hasNote(self: *Notes, row: usize, col: usize, num: u8) bool {
+    pub fn hasNote(self: *Notes, row: usize, col: usize, num: usize) bool {
         const idx = index(row, col, num);
         return self.data[idx] != 0;
     }
 
-    fn index(row: usize, col: usize, num: u8) u64 {
+    fn index(row: usize, col: usize, num: usize) u64 {
         return row * 81 + col * 9 + (num - 1);
     }
 };
@@ -509,9 +489,9 @@ fn placeSingleNumbers(notes: *Notes, sudoku: *Sudoku) bool {
                     continue;
                 }
 
-                const number = notes.getSingleNote(@intCast(row), @intCast(col)) orelse continue;
+                const number = notes.getSingleNote(row, col) orelse continue;
                 sudoku.puzzle[row * 9 + col] = number;
-                notes.updateNotesAfterPlacingNumber(@intCast(row), @intCast(col), number);
+                notes.updateNotesAfterPlacingNumber(row, col, number);
                 found_number = true;
                 found_any_number = true;
             }
@@ -564,7 +544,7 @@ fn placeSingleNumberInRowColOrSquare(notes: *Notes, sudoku: *Sudoku) bool {
                     }
                     if (!has_in_col) {
                         sudoku.puzzle[row * 9 + col] = @intCast(num);
-                        notes.updateNotesAfterPlacingNumber(@intCast(row), @intCast(col), @intCast(num));
+                        notes.updateNotesAfterPlacingNumber(row, col, num);
                         found_any_number = true;
                         break;
                     }
@@ -587,7 +567,7 @@ fn placeSingleNumberInRowColOrSquare(notes: *Notes, sudoku: *Sudoku) bool {
                     }
                     if (!has_in_row) {
                         sudoku.puzzle[row * 9 + col] = @intCast(num);
-                        notes.updateNotesAfterPlacingNumber(@intCast(row), @intCast(col), @intCast(num));
+                        notes.updateNotesAfterPlacingNumber(row, col, num);
                         found_any_number = true;
                         break;
                     }
@@ -615,7 +595,7 @@ fn placeSingleNumberInRowColOrSquare(notes: *Notes, sudoku: *Sudoku) bool {
                     }
                     if (!has_in_square) {
                         sudoku.puzzle[row * 9 + col] = @intCast(num);
-                        notes.updateNotesAfterPlacingNumber(@intCast(row), @intCast(col), @intCast(num));
+                        notes.updateNotesAfterPlacingNumber(row, col, num);
                         found_any_number = true;
                         break;
                     }
